@@ -1,7 +1,7 @@
 import os
 from flask import Flask, request
 
-app = Flask(name)
+app = Flask(__name__)  # ✅ هنا التصليح
 
 TOKEN = "8490776623:AAFD3Q6th51Y_DDkx0OEj-gVP7U5rpc3HO8"
 BASE_URL = f"https://api.telegram.org/bot{TOKEN}"
@@ -12,7 +12,6 @@ def webhook():
     if data:
         chat_id = data["message"]["chat"]["id"]
         text = data["message"].get("text", "")
-        # إرسال رد بسيط
         import requests
         requests.post(f"{BASE_URL}/sendMessage", json={
             "chat_id": chat_id,
@@ -24,6 +23,6 @@ def webhook():
 def home():
     return "Bot is running", 200
 
-if name == "main":
+if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
