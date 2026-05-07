@@ -1,2 +1,5 @@
 flask
 requests
+python-telegram
+telethon
+cryptg
