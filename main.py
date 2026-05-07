@@ -41,28 +41,28 @@ def send_message(chat_id, text, reply_markup=None):
     requests.post(f"{BASE_URL}/sendMessage", json=payload)
 
 def get_main_keyboard():
-    """الأزرار الرئيسية للبوت"""
+    """الأزرار الرئيسية الشفافة للبوت"""
     return {
-        "keyboard": [
-            [{"text": "💬 محادثة عادية"}, {"text": "🖼️ إنشاء صورة"}],
-            [{"text": "ℹ️ عن البوت"}, {"text": "🔄 إعادة تشغيل"}]
-        ],
-        "resize_keyboard": True,
-        "one_time_keyboard": False
+        "inline_keyboard": [
+            [{"text": "💬 محادثة عادية", "callback_data": "chat_mode"}],
+            [{"text": "ℹ️ عن البوت", "callback_data": "about"}],
+            [{"text": "🔄 إعادة تشغيل", "callback_data": "restart"}]
+        ]
     }
 
 def get_back_keyboard():
-    """زر الرجوع"""
+    """زر الرجوع الشفاف"""
     return {
-        "keyboard": [[{"text": "🔙 رجوع للقائمة"}]],
-        "resize_keyboard": True,
-        "one_time_keyboard": False
+        "inline_keyboard": [
+            [{"text": "🔙 رجوع للقائمة", "callback_data": "back_to_menu"}]
+        ]
     }
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json()
     
+    # معالجة الرسائل النصية
     if data and "message" in data:
         chat_id = data["message"]["chat"]["id"]
         text = data["message"].get("text", "")
@@ -73,23 +73,57 @@ def webhook():
             "action": "typing"
         })
         
-        # 🎯 التعامل مع الأوامر والأزرار
-        if text == "/start" or text == "🔄 إعادة تشغيل":
+        # التعامل مع الأوامر
+        if text == "/start":
             send_message(
                 chat_id,
                 "👋 <b>مرحباً بك في بوت FM AI!</b>\n\n"
                 "أنا بوت ذكي مدعوم بالذكاء الاصطناعي، أقدر أساعدك في:\n"
                 "• 💬 محادثة ذكية بالعربية\n"
-                "• 🖼️ إنشاء صور بالوصف\n\n"
+                "• 📝 الإجابة على أسئلتك\n"
+                "• 🧠 تقديم معلومات مفيدة\n\n"
+                "اختر من الأزرار أدناه 👇",
+                get_main_keyboard()
+            )
+        else:
+            # إرسال للذكاء الاصطناعي
+            reply = get_ai_reply(text)
+            send_message(chat_id, reply, get_main_keyboard())
+    
+    # معالجة الأزرار الشفافة (callback queries)
+    elif data and "callback_query" in data:
+        callback_id = data["callback_query"]["id"]
+        chat_id = data["callback_query"]["message"]["chat"]["id"]
+        callback_data = data["callback_query"]["data"]
+        
+        # الرد على callback query
+        requests.post(f"{BASE_URL}/answerCallbackQuery", json={
+            "callback_query_id": callback_id
+        })
+        
+        # إرسال حالة "يكتب..."
+        requests.post(f"{BASE_URL}/sendChatAction", json={
+            "chat_id": chat_id,
+            "action": "typing"
+        })
+        
+        if callback_data == "restart":
+            send_message(
+                chat_id,
+                "👋 <b>مرحباً بك في بوت FM AI!</b>\n\n"
+                "أنا بوت ذكي مدعوم بالذكاء الاصطناعي، أقدر أساعدك في:\n"
+                "• 💬 محادثة ذكية بالعربية\n"
+                "• 📝 الإجابة على أسئلتك\n"
+                "• 🧠 تقديم معلومات مفيدة\n\n"
                 "اختر من الأزرار أدناه 👇",
                 get_main_keyboard()
             )
         
-        elif text == "ℹ️ عن البوت":
+        elif callback_data == "about":
             send_message(
                 chat_id,
                 "🤖 <b>بوت FM AI</b>\n\n"
-                "• النسخة: 1.0\n"
+                "• النسخة: 2.0\n"
                 "• الذكاء: Llama 3.3 70B\n"
                 "• الخادم: kruri.qzz.io\n"
                 "• المطور: مريم محمد 🛡️\n\n"
@@ -97,25 +131,28 @@ def webhook():
                 get_main_keyboard()
             )
         
-        elif text == "🔙 رجوع للقائمة":
-            send_message(chat_id, "تم الرجوع للقائمة الرئيسية ✅", get_main_keyboard())
+        elif callback_data == "chat_mode":
+            send_message(
+                chat_id,
+                "💬 <b>تم تفعيل وضع المحادثة</b>\n\n"
+                "اكتب رسالتك وسأرد عليك فوراً!\n"
+                "يمكنك سؤالي عن أي شيء تريده.",
+                get_main_keyboard()
+            )
         
-        elif text == "💬 محادثة عادية":
-            send_message(chat_id, "تم تفعيل وضع المحادثة 💬\nاكتب رسالتك وسأرد عليك فوراً!", get_back_keyboard())
-        
-        elif text == "🖼️ إنشاء صورة":
-            send_message(chat_id, "تم تفعيل وضع إنشاء الصور 🖼️\nاكتب وصف الصورة وسأحاول إنشائها!", get_back_keyboard())
-        
-        else:
-            # إرسال للذكاء الاصطناعي
-            reply = get_ai_reply(text)
-            send_message(chat_id, reply, get_back_keyboard())
+        elif callback_data == "back_to_menu":
+            send_message(
+                chat_id,
+                "✅ <b>تم الرجوع للقائمة الرئيسية</b>\n\n"
+                "اختر ما تريد من الأزرار أدناه:",
+                get_main_keyboard()
+            )
     
     return "OK", 200
 
 @app.route("/")
 def home():
-    return "Bot AI is running with Keyboards", 200
+    return "Bot AI is running with Inline Keyboards", 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
