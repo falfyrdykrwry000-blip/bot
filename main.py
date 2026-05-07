@@ -38,7 +38,21 @@ def send_message(chat_id, text, reply_markup=None):
     if reply_markup:
         payload["reply_markup"] = reply_markup
     
-    requests.post(f"{BASE_URL}/sendMessage", json=payload)
+    response = requests.post(f"{BASE_URL}/sendMessage", json=payload)
+    return response.json().get("result", {}).get("message_id")
+
+def edit_message(chat_id, message_id, text, reply_markup=None):
+    """تعديل رسالة موجودة"""
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": "HTML"
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    
+    requests.post(f"{BASE_URL}/editMessageText", json=payload)
 
 def get_main_keyboard():
     """الأزرار الرئيسية الشفافة للبوت"""
@@ -88,12 +102,14 @@ def webhook():
         else:
             # إرسال للذكاء الاصطناعي
             reply = get_ai_reply(text)
-            send_message(chat_id, reply, get_main_keyboard())
+            send_message(chat_id, reply, get_back_keyboard())
     
     # معالجة الأزرار الشفافة (callback queries)
     elif data and "callback_query" in data:
         callback_id = data["callback_query"]["id"]
-        chat_id = data["callback_query"]["message"]["chat"]["id"]
+        message = data["callback_query"]["message"]
+        chat_id = message["chat"]["id"]
+        message_id = message["message_id"]
         callback_data = data["callback_query"]["data"]
         
         # الرد على callback query
@@ -108,8 +124,10 @@ def webhook():
         })
         
         if callback_data == "restart":
-            send_message(
+            # تعديل نفس الرسالة عند الضغط على إعادة تشغيل
+            edit_message(
                 chat_id,
+                message_id,
                 "👋 <b>مرحباً بك في بوت FM AI!</b>\n\n"
                 "أنا بوت ذكي مدعوم بالذكاء الاصطناعي، أقدر أساعدك في:\n"
                 "• 💬 محادثة ذكية بالعربية\n"
@@ -120,8 +138,10 @@ def webhook():
             )
         
         elif callback_data == "about":
-            send_message(
+            # تعديل نفس الرسالة عند الضغط على عن البوت
+            edit_message(
                 chat_id,
+                message_id,
                 "🤖 <b>بوت FM AI</b>\n\n"
                 "• النسخة: 2.0\n"
                 "• الذكاء: Llama 3.3 70B\n"
@@ -132,8 +152,10 @@ def webhook():
             )
         
         elif callback_data == "chat_mode":
-            send_message(
+            # تعديل نفس الرسالة عند الضغط على محادثة عادية
+            edit_message(
                 chat_id,
+                message_id,
                 "💬 <b>تم تفعيل وضع المحادثة</b>\n\n"
                 "اكتب رسالتك وسأرد عليك فوراً!\n"
                 "يمكنك سؤالي عن أي شيء تريده.",
@@ -141,10 +163,16 @@ def webhook():
             )
         
         elif callback_data == "back_to_menu":
-            send_message(
+            # تعديل نفس الرسالة عند الرجوع للقائمة
+            edit_message(
                 chat_id,
-                "✅ <b>تم الرجوع للقائمة الرئيسية</b>\n\n"
-                "اختر ما تريد من الأزرار أدناه:",
+                message_id,
+                "👋 <b>مرحباً بك في بوت FM AI!</b>\n\n"
+                "أنا بوت ذكي مدعوم بالذكاء الاصطناعي، أقدر أساعدك في:\n"
+                "• 💬 محادثة ذكية بالعربية\n"
+                "• 📝 الإجابة على أسئلتك\n"
+                "• 🧠 تقديم معلومات مفيدة\n\n"
+                "اختر من الأزرار أدناه 👇",
                 get_main_keyboard()
             )
     
@@ -152,7 +180,7 @@ def webhook():
 
 @app.route("/")
 def home():
-    return "Bot AI is running with Inline Keyboards", 200
+    return "Bot AI is running with Edit Message Feature", 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
